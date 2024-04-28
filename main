@@ -57,16 +57,46 @@ def interpolate_df(data, cf_date, suffix = ''):
     data['discount_factor' + suffix] = np.exp(-data['year_frac_t0'] * data['z0' + suffix])
     data['discount_factor' + suffix] = data['discount_factor' + suffix].fillna (1)
 
+def cycle_for_csa(deals_csa, forward_date_list, St_d):
+    today = forward_date_list[0]
+    mpor = today + datetime.timedelta(days=14)
+    forward_date_list_for_csa = list(filter(lambda x: x <= mpor, forward_date_list))
+    for d in forward_date_list_for_csa:
+        print('csa:', d)
+
+
 def main(St, deals):
     deals_all = pd.DataFrame()
-    forward_date_list = set(St['forward_date'])
+    forward_date_list = list(set(St['forward_date']))
+    forward_date_list.sort()
+    #deals_csa = deals[deals['csa'] == 'Y'].copy()
+    #deals_csa = cycle_for_csa(deals_csa, forward_date_list, St_d)
+    #deals = deals[deals['csa'] == 'N']
     for d in forward_date_list:
-        print(d)
+        #print(d)
         St_d = St[St['forward_date'] == d].copy()
         deals_mtm = mtm_calc(deals, St_d, d)
         deals_mtm['forward_date'] = d
         deals_all = pd.concat([deals_all, deals_mtm])
+    deals_csa = deals_all[deals_all['csa'] == 'Y'].copy()
+    deals_all = deals_all[deals_all['csa'] == 'N']
+    deals_csa_pfe_limited = csa_pfe_limitation(deals_csa, forward_date_list)
+    deals_all = pd.concat([deals_all, deals_csa_pfe_limited])
     return deals_all
+
+def csa_pfe_limitation(deals, forward_date_list):
+    deals = deals.sort_values(by=['client', 'forward_date'])
+    deals['mtm_adjusted'] = deals.groupby('client')['mtm'].transform(lambda x: x - x.iloc[0]) # because varmargin covers current MtM revaluation
+    deals['mtm'] = deals['mtm_adjusted']
+    deals.drop(['mtm_adjusted'], axis=1)
+    today = forward_date_list[0]
+    mpor_date = today + datetime.timedelta(days=14) #RISDA margin period of risk is 14 days
+    mask = deals['forward_date'] > mpor_date
+    mpor_mtm = deals[deals['forward_date'] == mpor_date].set_index('client')['mtm']
+    deals.loc[mask, 'mtm'] = deals.loc[mask, 'client'].map(mpor_mtm)
+    1==1
+    return deals
+    #deals[mpor_pfe] =
 
 def mtm_calc(deals, St_d, d):
     deals['days'] = (deals['mat_date'] - d).dt.days
@@ -74,7 +104,7 @@ def mtm_calc(deals, St_d, d):
     deals = join_df(deals, St_d, cf_date_type='mat_date')
     deals = join_fx(deals, St_d)
     deals['mtm'] = deals['amt'] * deals['discount_factor_fxd'] * deals['value']
-    deals = deals.groupby(['deal_id', 'client', 'product'], as_index=False).agg({'mtm': 'sum'}).reset_index()
+    deals = deals.groupby(['client', 'csa'], as_index=False).agg({'mtm': 'sum'}).reset_index()   #отсюда убрал продукт
     return deals
 
 def parce_rf(St, col_names, report_date):
@@ -88,7 +118,7 @@ def parce_rf(St, col_names, report_date):
 
 
 #get deals
-deals = pd.read_excel('/Users/mihailzaytsev/Desktop/Диссер_мага/deals_for_GBM.xlsx', engine='openpyxl')
+deals = pd.read_excel('/Users/mihailzaytsev/Desktop/Диссер_мага/deals_for_GBM_2_cust.xlsx', engine='openpyxl')
 deals['mat_date'] = pd.to_datetime(deals['mat_date'])
 
 #get market data
@@ -124,8 +154,8 @@ df_log_returns = all_df.apply(lambda x: (np.log(x / x.shift(1))).fillna(0), axis
 
 #####################
 # find necessary parametres of input market data
-num_sims = 100
-years = 1
+num_sims = 300
+years = 2
 steps = 52 * years + 1
 steps = int(steps)
 num_of_risk_factors = df_log_returns.shape[1]
@@ -198,19 +228,60 @@ print('Execution time:', elapsed_time, 'seconds')
 #pivot_df = mtm_generated.pivot_table(index='nums', columns='forward_date', values='mtm', aggfunc='sum')
 #mtm_generated['forward_date'] = mtm_generated['forward_date'].dt.strftime('%d.%m.%Y')
 
-melted_df = mtm_generated.pivot(index='nums', columns='forward_date', values='mtm').reset_index().melt(id_vars='nums', var_name='forward_date', value_name='mtm')
+mtm_generatied_total_bank = mtm_generated.groupby(['forward_date', 'nums'], as_index=False).agg({'mtm': 'sum'}).reset_index()
+
+melted_df = mtm_generatied_total_bank.pivot(index='nums', columns='forward_date', values='mtm').reset_index().melt(id_vars='nums', var_name='forward_date', value_name='mtm')
+mtm_generated = mtm_generated.sort_values(by=['forward_date', 'nums'])
+
 
 # Sort the DataFrame by 'forward_date' for proper plotting of line segments
 melted_df.sort_values(by=['nums', 'forward_date'], inplace=True)
 
-# Plotting line segments
-for num in melted_df['nums'].unique():
-    data_subset = melted_df[melted_df['nums'] == num]
-    plt.plot(data_subset['forward_date'], data_subset['mtm'], marker='o', label=f'nums={num}')
+# # Plotting line segments
+# for num in melted_df['nums'].unique():
+#     data_subset = melted_df[melted_df['nums'] == num]
+#     plt.plot(data_subset['forward_date'], data_subset['mtm'], marker='o', label=f'nums={num}')
+#
+# plt.xlabel('forward_date')
+# plt.ylabel('mtm')
+# plt.title('PFE of Derivatives portfolio')
+# #plt.legend()
+# plt.grid(True)
+# plt.show()
 
-plt.xlabel('forward_date')
-plt.ylabel('mtm')
-plt.title('Line Segments Plot of Pivot Table')
-plt.legend()
-plt.grid(True)
-plt.show()
+#determine time tenors on which you are going to price MtM + PFE
+
+W1 = report_date + datetime.timedelta(days=1*7)
+M1 = report_date + datetime.timedelta(days=4*7)
+M3 = report_date + datetime.timedelta(days=3*4*7)
+M6 = report_date + datetime.timedelta(days=6*4*7)
+Y1 = report_date + datetime.timedelta(days=12*4*7)
+Y6 = report_date + datetime.timedelta(days=6*12*4*7)
+Y10 = report_date + datetime.timedelta(days=10*12*4*7)
+
+mtm_generated_with_tenors = mtm_generated[mtm_generated['forward_date'].isin([W1, M1, M3, M6, Y1, Y6, Y10])].copy()
+
+grand_final = pd.DataFrame()
+client_list = list(set(mtm_generated_with_tenors['client']))
+for client in client_list:
+    exp_of_the_client = mtm_generated_with_tenors[mtm_generated_with_tenors['client'] == client].copy()
+    dates_list = list(set(exp_of_the_client['forward_date']))
+    client_metrics = pd.DataFrame()
+    for date in dates_list:
+        exp_of_the_client_on_date = exp_of_the_client[exp_of_the_client['forward_date'] == date].copy()
+        positive_exp = exp_of_the_client_on_date[exp_of_the_client_on_date['mtm'] >= 0]
+        negative_exp = exp_of_the_client_on_date[exp_of_the_client_on_date['mtm'] <= 0]
+        pfe = positive_exp['mtm'].quantile(0.99)
+        epe = positive_exp['mtm'].quantile(0.5)
+        ene = negative_exp['mtm'].quantile(0.5)
+        result = dict({'client': client, 'date': date, 'pfe': pfe, 'epe': epe, 'ene': ene})
+        result = pd.DataFrame([result])
+        client_metrics = pd.concat([client_metrics, result], ignore_index=True)
+    client_metrics = client_metrics.groupby(['client'], as_index=False).agg({'pfe': 'max', 'epe': 'max', 'ene': 'min'}).reset_index()
+    grand_final = pd.concat([grand_final, client_metrics], ignore_index=True)
+
+print(grand_final)
+
+grand_final.to_csv('grand_final.csv')
+
+print('Ok')
