@@ -1,0 +1,216 @@
+import pandas as pd
+import numpy as np
+import math
+from scipy.stats import norm
+import numpy as np
+import matplotlib.pyplot as plt
+import datetime
+import time
+
+def prepare_discount_factors(St_d):
+
+    discount_factors = St_d[~(St_d['risk_factor'].isin(['usd', 'eur', 'rub']))].copy()
+    discount_factors['risk_factor'] = discount_factors['risk_factor'].astype(float)
+    discount_factors['gap_date'] = discount_factors.apply(lambda row: row['forward_date'] + datetime.timedelta(days=round(365 * row['risk_factor'])), axis=1)
+    discount_factors = discount_factors.sort_values(by=['gap_date'])
+    discount_factors['bidval'] = np.exp(-1 * discount_factors['value']/100*((discount_factors['gap_date'] - discount_factors['forward_date']).dt.days)/365)
+    discount_factors['next_gap_date'] = discount_factors['gap_date'].shift(-1)
+    discount_factors['next_risk_factor'] = discount_factors['risk_factor'].shift(-1)
+    discount_factors['next_bidval'] = discount_factors['bidval'].shift(-1)
+    discount_factors['next_bidval'] = discount_factors['next_bidval'].fillna(0)
+    discount_factors = discount_factors.rename(columns={"gap_date": "prev_gap_date"})
+    return discount_factors
+
+def join_fx(deals, St):
+    St = St[St['risk_factor'].isin(['usd', 'eur'])].copy()
+    deals = deals.merge(St[['forward_date', 'risk_factor', 'value']], how='left', left_on=['forward_date', 'ccy'], right_on=['forward_date', 'risk_factor']).drop('risk_factor', axis = 1)
+    deals['value'] = deals['value'].fillna(1)
+    return deals
+
+def join_df(cash_flow_full, discount_factors, cf_date_type = 'mat_date', suffix = '_fxd'):
+    discount_factors = prepare_discount_factors(discount_factors)
+    cash_flow_full_df = cash_flow_full.merge(discount_factors[['bidval', 'next_bidval', 'forward_date', 'prev_gap_date', 'next_gap_date']],
+                                                   how='left', left_on=['forward_date'],
+                                          right_on = ['forward_date'])
+
+    cash_flow_full_df = cash_flow_full_df[(cash_flow_full_df['prev_gap_date'] <= cash_flow_full_df['mat_date'])
+                                                & (cash_flow_full_df['mat_date'] <
+                                                   cash_flow_full_df['next_gap_date'])].rename(
+                                                columns={"bidval": "bidval" + suffix,
+                                                         "next_bidval": "next_bidval" + suffix,
+                                                         "prev_gap_date": "prev_gap_date" + suffix,
+                                                         "next_gap_date": "next_gap_date" + suffix})
+    interpolate_df(cash_flow_full_df, cf_date_type, suffix)
+    return cash_flow_full_df
+
+def interpolate_df(data, cf_date, suffix = ''):
+    data['year_frac_t1'] = (data['prev_gap_date' + suffix] - (data['forward_date'])).dt.days / 365.0
+    data['year_frac_t2'] = (data['next_gap_date' + suffix] - data['forward_date']).dt.days / 365.0
+    data['year_frac_t0'] = (data[cf_date] - data['forward_date']).dt.days / 365.0
+    data['z1'] = -(1 / data['year_frac_t1']) * np.log(data['bidval'  + suffix].astype(float))
+    data['z2'] = -(1 / data['year_frac_t2']) * np.log(data['next_bidval'  + suffix].astype(float))
+    data.loc[data['z1'].isnull(), 'z1'] = data.loc[data['z1'].isnull(), 'z2']
+    data.loc[data['bidval' + suffix] == 1, 'z1'] = data.loc[data['bidval' + suffix] == 1, 'z2']
+    data['z0'  + suffix] = (data['z2'] * (data['year_frac_t0'] - data['year_frac_t1']) +
+                 data['z1']  * (data['year_frac_t2'] - data['year_frac_t0'])) / \
+                           (data['year_frac_t2'] - data['year_frac_t1'])
+    data['discount_factor' + suffix] = np.exp(-data['year_frac_t0'] * data['z0' + suffix])
+    data['discount_factor' + suffix] = data['discount_factor' + suffix].fillna (1)
+
+def main(St, deals):
+    deals_all = pd.DataFrame()
+    forward_date_list = set(St['forward_date'])
+    for d in forward_date_list:
+        print(d)
+        St_d = St[St['forward_date'] == d].copy()
+        deals_mtm = mtm_calc(deals, St_d, d)
+        deals_mtm['forward_date'] = d
+        deals_all = pd.concat([deals_all, deals_mtm])
+    return deals_all
+
+def mtm_calc(deals, St_d, d):
+    deals['days'] = (deals['mat_date'] - d).dt.days
+    deals['forward_date'] = d
+    deals = join_df(deals, St_d, cf_date_type='mat_date')
+    deals = join_fx(deals, St_d)
+    deals['mtm'] = deals['amt'] * deals['discount_factor_fxd'] * deals['value']
+    deals = deals.groupby(['deal_id', 'client', 'product'], as_index=False).agg({'mtm': 'sum'}).reset_index()
+    return deals
+
+def parce_rf(St, col_names, report_date):
+    St_df = pd.DataFrame(St, columns=col_names)
+    melted_St = St_df.melt(id_vars=['time_delta'], var_name='risk_factor', value_name='value')
+    melted_St.reset_index(drop=True, inplace=True)
+    melted_St['forward_date'] = melted_St.apply(lambda row: report_date + datetime.timedelta(days=round(365 * row['time_delta'])), axis=1)
+    melted_St.drop('time_delta', axis=1, inplace=True)
+    return melted_St
+
+
+
+#get deals
+deals = pd.read_excel('/Users/mihailzaytsev/Desktop/Диссер_мага/deals_for_GBM.xlsx', engine='openpyxl')
+deals['mat_date'] = pd.to_datetime(deals['mat_date'])
+
+#get market data
+data_ir = pd.read_excel('/Users/mihailzaytsev/Desktop/Диссер_мага/market_data_gcurve.xlsx', engine='openpyxl')
+data_fx = pd.read_excel('/Users/mihailzaytsev/Desktop/Диссер_мага/market_data_fx.xlsx', engine='openpyxl')
+
+dates_df = set(data_ir['tradedate'])
+dates_df = pd.DataFrame(dates_df, columns = ['tradedate'])
+
+period_list = set(data_ir['period'])
+
+for p in period_list: #to get risk factors in matrix form
+    p_df = data_ir[data_ir['period'] == p].copy()
+    p_df = p_df.rename(columns = {'value': p})
+    p_df.drop(['tradetime', 'period'], axis= 1, inplace= True)
+    dates_df = pd.merge(dates_df, p_df, how = 'left', on = 'tradedate')
+
+usd_rub = (data_fx[data_fx['secid'] == 'USDFIXME']).rename(columns = {'rate': 'usd'})
+usd_rub.drop('secid', axis= 1 , inplace= True )
+eur_rub = (data_fx[data_fx['secid'] == 'EURFIXME']).rename(columns = {'rate': 'eur'})
+eur_rub.drop('secid', axis= 1 , inplace= True )
+
+fx_df = pd.merge(usd_rub, eur_rub, how = 'left', on = 'tradedate')
+all_df = pd.merge(fx_df, dates_df, how = 'left', on = 'tradedate')
+report_date = all_df['tradedate'].iloc[-1]
+report_date = datetime.datetime.strptime(report_date, '%Y-%m-%d')
+
+all_df.drop('tradedate', axis= 1, inplace= True)
+all_df_col_names = all_df.columns.tolist()
+all_df_col_names.append('time_delta')
+
+df_log_returns = all_df.apply(lambda x: (np.log(x / x.shift(1))).fillna(0), axis=0)
+
+#####################
+# find necessary parametres of input market data
+num_sims = 100
+years = 1
+steps = 52 * years + 1
+steps = int(steps)
+num_of_risk_factors = df_log_returns.shape[1]
+
+meanReturns = df_log_returns.mean() * 5
+sdrt_div = df_log_returns.std() * math.sqrt(5)
+covMatrix = df_log_returns.cov()
+corrMatrix = df_log_returns.corr()
+
+S0 = ((all_df.iloc[-1]).to_numpy()).T # here changed df_log_returns =>
+dt = 1/((steps-1)/years)
+chol = np.linalg.cholesky(corrMatrix) #get cholezky decomposition to mind the correlation of fx and ir epsilons
+
+#convert to arrays
+mean_returns_col = meanReturns.to_numpy()
+sdrt_div_col = sdrt_div.to_numpy()
+
+n = 0
+st = time.time()
+St_full = np.empty([steps, num_of_risk_factors])
+mtm_generated = pd.DataFrame()
+while n < num_sims:
+    #generate standard normal non-correlated outcomes
+    uncrlted_eps = np.random.normal(size=(steps-1, df_log_returns.shape[1]))
+
+    #correlate them through cholezky matrix
+    crlted_eps = (chol @ uncrlted_eps.T)
+
+    #some adjustments
+    num_columns = crlted_eps.shape[1]
+    sdrt_div_col_reshaped = (np.tile(sdrt_div_col, (num_columns, 1))).T
+
+    #calculation of gbm
+    drift = (mean_returns_col - sdrt_div_col ** 2 / 2) * dt
+    drift_reshaped = (np.tile(drift, (num_columns, 1))).T
+    stochastic = crlted_eps * sdrt_div_col_reshaped * np.sqrt(dt)
+    ito_process = drift_reshaped + stochastic
+    St = (np.exp(ito_process)).T
+    St = np.vstack([np.ones(num_of_risk_factors), St])
+    St = S0 * St.cumprod(axis=0)
+
+    # Define t interval correctly
+    t = np.linspace(0, years, steps)
+    t_column = t.reshape(-1, 1)
+
+    # Require numpy array that is the same shape as St
+    tt = np.full(shape=(num_of_risk_factors, steps), fill_value=t).T
+
+    #plt.plot(tt, St)
+    #plt.xlabel("Years $(t)$")
+    #plt.ylabel("Risk Factirs $(S_t)$")
+    #plt.title(
+    #    "Realizations of Geometric Brownian Motion\n $dS_t = \mu S_t dt + \sigma S_t dW_t$\n"
+    #)
+    #plt.show()
+
+    St = np.concatenate((St, t_column), axis = 1)
+
+    St = parce_rf(St, all_df_col_names, report_date)
+    St = main(St, deals)
+    n += 1
+    print(n)
+    St['nums'] = n
+    mtm_generated = pd.concat([mtm_generated, St])
+
+et = time.time()
+elapsed_time = et - st
+print('Execution time:', elapsed_time, 'seconds')
+
+#pivot_df = mtm_generated.pivot_table(index='nums', columns='forward_date', values='mtm', aggfunc='sum')
+#mtm_generated['forward_date'] = mtm_generated['forward_date'].dt.strftime('%d.%m.%Y')
+
+melted_df = mtm_generated.pivot(index='nums', columns='forward_date', values='mtm').reset_index().melt(id_vars='nums', var_name='forward_date', value_name='mtm')
+
+# Sort the DataFrame by 'forward_date' for proper plotting of line segments
+melted_df.sort_values(by=['nums', 'forward_date'], inplace=True)
+
+# Plotting line segments
+for num in melted_df['nums'].unique():
+    data_subset = melted_df[melted_df['nums'] == num]
+    plt.plot(data_subset['forward_date'], data_subset['mtm'], marker='o', label=f'nums={num}')
+
+plt.xlabel('forward_date')
+plt.ylabel('mtm')
+plt.title('Line Segments Plot of Pivot Table')
+plt.legend()
+plt.grid(True)
+plt.show()
