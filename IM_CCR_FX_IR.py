@@ -111,7 +111,7 @@ def ir_mtm_calc(deals, St_d, d):
     deals = join_df(deals, St_d, cf_date_type='mat_date', suffix = '_end')
     deals['forward_rate'] = (deals['discount_factor_st']/deals['discount_factor_end'] - 1) * 365 / (deals['mat_date'] - (deals['start_date'])).dt.days
 
-    #I'm terribly sorry for the following hardcode, but I was very tired and run out of time to difine a function fixing rates on fixed legs
+    #это хардкодище надо потом подумать как убрать 
 
     St_d_short_rates = St_d[St_d['risk_factor'].str.strip().str[-4:] == '0.25'].copy()
 
