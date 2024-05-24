@@ -100,7 +100,6 @@ if return_rescaling == True:
 # plt.plot(df_returns['RUB_IR_0.25']) #to show volatility rescaling
 # plt.show()
 
-#####################
 #define necessary parametres of the model
 
 num_sims = 100
